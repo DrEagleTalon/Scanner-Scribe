@@ -225,6 +225,14 @@ class ScannerScribeGUI:
             "Could not open input stream with this device/channels. Try changing Sample Rate or selecting another input device."
         )
 
+    def _format_compare_block(self, raw_text, clean_text, confidence):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if confidence is None:
+            conf_text = "n/a"
+        else:
+            conf_text = f"{confidence:.2f}"
+        return f"[{timestamp}] [conf={conf_text}]\nRAW:   {raw_text}\nCLEAN: {clean_text}"
+
     def transcription_worker(self):
         wav_file = None
         clean_fh = None
@@ -276,6 +284,7 @@ class ScannerScribeGUI:
                 sample_rate = working_rate
 
             recognizer = KaldiRecognizer(model, sample_rate)
+            recognizer.SetWords(True)
 
             def audio_callback(indata, frames, time_info, status):
                 if status:
@@ -323,7 +332,7 @@ class ScannerScribeGUI:
                     self.gui_queue.put(("clean", clean_text))
 
                     if compare_fh is not None:
-                        compare_block = f"CONF: {confidence:.2f}\nRAW: {raw_text}\nCLEAN: {clean_text}"
+                        compare_block = self._format_compare_block(raw_text, clean_text, confidence)
                         compare_fh.write(compare_block + "\n\n")
                         compare_fh.flush()
                         self.gui_queue.put(("compare", compare_block))
@@ -332,14 +341,17 @@ class ScannerScribeGUI:
                 final_raw = final_result.get("text", "").strip()
                 if final_raw:
                     final_clean = final_raw
-                    final_confidence = "n/a (final)"
+                    final_words = final_result.get("result", [])
+                    final_confidence = None
+                    if final_words:
+                        final_confidence = sum(float(x.get("conf", 0.0)) for x in final_words) / len(final_words)
                     if self.enable_corrections_var.get():
                         for pattern, replacement in REPLACEMENTS:
                             final_clean = re.sub(pattern, replacement, final_clean, flags=re.IGNORECASE)
                     clean_fh.write(final_clean + "\n")
                     self.gui_queue.put(("clean", final_clean))
                     if compare_fh is not None:
-                        final_compare_block = f"CONF: {final_confidence}\nRAW: {final_raw}\nCLEAN: {final_clean}"
+                        final_compare_block = self._format_compare_block(final_raw, final_clean, final_confidence)
                         compare_fh.write(final_compare_block + "\n\n")
                         compare_fh.flush()
                         self.gui_queue.put(("compare", final_compare_block))
