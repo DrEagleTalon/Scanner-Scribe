@@ -1,0 +1,42 @@
+wabash county
+grant county
+wabash city
+north manchester
+lagro
+lafontaine
+marion
+gas city
+jonesboro
+sheriff
+deputy
+dispatch
+county units
+city units
+traffic stop
+domestic
+shots fired
+firearm
+gun
+male subject
+female subject
+vehicle pursuit
+foot pursuit
+overdose
+ems
+medic
+structure fire
+personal injury accident
+property damage accident
+10 4
+10 8
+10 9
+10 10
+10 32
+10 50
+10 76
+10 95
+signal 8
+in custody
+en route
+on scene
+clear the scene
