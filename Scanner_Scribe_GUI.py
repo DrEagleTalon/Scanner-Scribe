@@ -198,6 +198,31 @@ class ScannerScribeGUI:
         if folder:
             self.audio_folder_var.set(folder)
 
+
+    def _resolve_sample_rate(self, device_index, requested_rate, channels):
+        fallback_rates = [
+            requested_rate,
+            int(sd.query_devices(device_index).get("default_samplerate", requested_rate)),
+            48000,
+            44100,
+            16000,
+        ]
+
+        checked = set()
+        for rate in fallback_rates:
+            if rate in checked or rate <= 0:
+                continue
+            checked.add(rate)
+            try:
+                sd.check_input_settings(device=device_index, samplerate=rate, channels=channels, dtype="int16")
+                return rate
+            except Exception:
+                continue
+
+        raise RuntimeError(
+            "Could not open input stream with this device/channels. Try changing Sample Rate or selecting another input device."
+        )
+
     def transcription_worker(self):
         wav_file = None
         clean_fh = None
@@ -235,8 +260,19 @@ class ScannerScribeGUI:
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(sample_rate)
 
+            device_info = sd.query_devices(device_index)
+            max_inputs = int(device_info.get("max_input_channels", 0))
+            if channels > max_inputs:
+                raise ValueError(f"Device supports up to {max_inputs} input channel(s), but {channels} were requested.")
+
             self.gui_queue.put(("status", "Loading Vosk model..."))
             model = Model(str(model_path))
+
+            working_rate = self._resolve_sample_rate(device_index, sample_rate, channels)
+            if working_rate != sample_rate:
+                self.gui_queue.put(("status", f"Requested {sample_rate} Hz failed; using {working_rate} Hz."))
+                sample_rate = working_rate
+
             recognizer = KaldiRecognizer(model, sample_rate)
 
             def audio_callback(indata, frames, time_info, status):
@@ -249,7 +285,7 @@ class ScannerScribeGUI:
 
             with sd.RawInputStream(
                 samplerate=sample_rate,
-                blocksize=8000,
+                blocksize=0,
                 device=device_index,
                 dtype="int16",
                 channels=channels,
