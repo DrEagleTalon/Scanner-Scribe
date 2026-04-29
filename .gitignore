@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Ignore downloaded Vosk models, but keep models/README.md
+models/*
+!models/README.md
+
+# Ignore transcript/audio output, but keep placeholder files
+transcripts/*
+!transcripts/.gitkeep
+
+audio_recordings/*
+!audio_recordings/.gitkeep
+
+# WAV/audio files
+*.wav
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
