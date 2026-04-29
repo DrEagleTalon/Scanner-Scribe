@@ -1,102 +1,42 @@
 import json
 import queue
 import re
-import sys
+import threading
 import wave
 from datetime import datetime
 from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+
 import sounddevice as sd
-from vosk import Model, KaldiRecognizer
-
-
-# --------------------------------------------------
-# SETTINGS
-# --------------------------------------------------
-
-# Make Directory relative to the scripts location instead of a hard coded location
+from vosk import KaldiRecognizer, Model
 
 BASE_DIR = Path(__file__).resolve().parent
-
-# Fast testing model
-MODEL_PATH = BASE_DIR / "models" / "vosk-model-small-en-us-0.15"
-
-# Normal model
-# MODEL_PATH = BASE_DIR / "models" / "vosk-model-en-us-0.22"
-
-# Big model
-# MODEL_PATH = BASE_DIR / "models" / "vosk-model-en-us-0.42-gigaspeech"
-
-TRANSCRIPT_FOLDER = BASE_DIR / "transcripts"
-AUDIO_FOLDER = BASE_DIR / "audio_recordings"
-
-# Switch models here when needed to hard code the paths, remove comment hash on these paths and add them to the BASE_DIR paths above.
-
-# Fast testing model:
-# MODEL_PATH = r"C:\scanner-scribe\models\vosk-model-small-en-us-0.15"
-
-# Big model:
-# MODEL_PATH = r"C:\scanner-scribe\models\vosk-model-en-us-0.42-gigaspeech"
-
-# TRANSCRIPT_FOLDER = r"C:\scanner-scribe\transcripts"
-# AUDIO_FOLDER = r"C:\scanner-scribe\audio_recordings"
-
-# For Stereo Mix / browser audio, 48000 is usually safer.
-SAMPLE_RATE = 48000
-
-# Use your actual input device.
-# For your Stereo Mix, this was probably 32.
-DEVICE_INDEX = 25
-
-# Keep this 1 unless you know you need stereo.
-CHANNELS = 1
-
-# Set True if you want to save the exact incoming audio to .wav.
-SAVE_WAV = True
-
-# Set True if you want a raw-vs-clean comparison transcript.
-SAVE_COMPARE = True
-
-# Set True if you want scanner correction rules applied.
-ENABLE_CORRECTIONS = True
-
-# --------------------------------------------------
-# SCANNER CORRECTION RULES
-# --------------------------------------------------
-# This is Level 1 "training": repeated mistake correction.
-# Add to this list as you notice bad repeated transcriptions.
+DEFAULT_MODEL_PATH = BASE_DIR / "models" / "vosk-model-small-en-us-0.15"
+DEFAULT_TRANSCRIPT_FOLDER = BASE_DIR / "transcripts"
+DEFAULT_AUDIO_FOLDER = BASE_DIR / "audio_recordings"
 
 REPLACEMENTS = [
-    # 10 codes
     (r"\bten four\b", "10-4"),
     (r"\bten fore\b", "10-4"),
     (r"\bten for\b", "10-4"),
-
     (r"\bten eight\b", "10-8"),
     (r"\bten ate\b", "10-8"),
-
     (r"\bten nine\b", "10-9"),
-
     (r"\bten thirty two\b", "10-32"),
     (r"\bten thirty too\b", "10-32"),
     (r"\bten thirty to\b", "10-32"),
-
     (r"\bten fifty\b", "10-50"),
     (r"\bten fifteen\b", "10-50"),
-
     (r"\bten seventy six\b", "10-76"),
     (r"\bten seven six\b", "10-76"),
-
     (r"\bten ninety five\b", "10-95"),
-    (r"\bten ninety-five\b", "10-95"),
-
-    # Common scanner phrases
     (r"\bshots fire\b", "shots fired"),
     (r"\bshot fired\b", "shots fired"),
     (r"\bin root\b", "en route"),
     (r"\bon seen\b", "on scene"),
     (r"\bclear to scene\b", "clear the scene"),
-
-    # Local names / places
     (r"\bwall bash\b", "Wabash"),
     (r"\bwab ash\b", "Wabash"),
     (r"\bnorth man chester\b", "North Manchester"),
@@ -105,481 +45,338 @@ REPLACEMENTS = [
     (r"\bgas city\b", "Gas City"),
     (r"\bjones burrow\b", "Jonesboro"),
     (r"\bjones borough\b", "Jonesboro"),
-
-    # Agencies / units
-    (r"\bgrant county sheriff's\b", "Grant County Sheriff's"),
-    (r"\bwabash county sheriff's\b", "Wabash County Sheriff's"),
-    (r"\bcounty unit\b", "county unit"),
-    (r"\bcounty units\b", "county units"),
 ]
 
-# --------------------------------------------------
-# CLI PROMPT HELPERS
-# --------------------------------------------------
 
-def ask_text(prompt, default=None):
-    if default is None:
-        value = input(f"{prompt}: ").strip()
-    else:
-        value = input(f"{prompt} [{default}]: ").strip()
+class ScannerScribeGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("ScannerScribe")
 
-    if value == "":
-        return default
+        self.stop_event = threading.Event()
+        self.gui_queue = queue.Queue()
+        self.audio_queue = queue.Queue()
+        self.worker_thread = None
+        self.device_map = {}
 
-    return value
+        self.build_form()
+        self.build_output_windows()
+        self.poll_gui_queue()
 
+    def build_form(self):
+        frame = ttk.LabelFrame(self.root, text="ScannerScribe Settings")
+        frame.pack(fill="x", padx=10, pady=10)
 
-def ask_yes_no(prompt, default=True):
-    if default:
-        hint = "Y/n"
-    else:
-        hint = "y/N"
+        self.model_var = tk.StringVar(value=str(DEFAULT_MODEL_PATH))
+        self.transcript_var = tk.StringVar(value=str(DEFAULT_TRANSCRIPT_FOLDER))
+        self.audio_folder_var = tk.StringVar(value=str(DEFAULT_AUDIO_FOLDER))
+        self.sample_rate_var = tk.StringVar(value="48000")
+        self.channels_var = tk.StringVar(value="1")
+        self.session_name_var = tk.StringVar()
 
-    while True:
-        value = input(f"{prompt} [{hint}]: ").strip().lower()
+        self.save_wav_var = tk.BooleanVar(value=True)
+        self.save_compare_var = tk.BooleanVar(value=True)
+        self.enable_corrections_var = tk.BooleanVar(value=True)
 
-        if value == "":
-            return default
+        ttk.Label(frame, text="Model Path").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.model_var, width=70).grid(row=0, column=1, sticky="ew")
+        ttk.Button(frame, text="Browse", command=self.browse_model).grid(row=0, column=2)
 
-        if value in ("y", "yes"):
-            return True
+        ttk.Label(frame, text="Audio Input").grid(row=1, column=0, sticky="w")
+        self.device_var = tk.StringVar()
+        self.device_combo = ttk.Combobox(frame, textvariable=self.device_var, width=70, state="readonly")
+        self.device_combo.grid(row=1, column=1, sticky="ew")
+        ttk.Button(frame, text="Refresh", command=self.load_audio_devices).grid(row=1, column=2)
 
-        if value in ("n", "no"):
-            return False
+        ttk.Label(frame, text="Sample Rate").grid(row=2, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.sample_rate_var, width=15).grid(row=2, column=1, sticky="w")
 
-        print("Please enter y or n.")
+        ttk.Label(frame, text="Channels").grid(row=3, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.channels_var, width=15).grid(row=3, column=1, sticky="w")
 
+        ttk.Label(frame, text="Session Name").grid(row=4, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.session_name_var, width=40).grid(row=4, column=1, sticky="w")
 
-def ask_int(prompt, default, minimum=None, maximum=None):
-    while True:
-        value = input(f"{prompt} [{default}]: ").strip()
+        ttk.Label(frame, text="Transcript Folder").grid(row=5, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.transcript_var, width=70).grid(row=5, column=1, sticky="ew")
+        ttk.Button(frame, text="Browse", command=self.browse_transcripts).grid(row=5, column=2)
 
-        if value == "":
-            return default
+        ttk.Label(frame, text="Audio Folder").grid(row=6, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.audio_folder_var, width=70).grid(row=6, column=1, sticky="ew")
+        ttk.Button(frame, text="Browse", command=self.browse_audio).grid(row=6, column=2)
 
+        ttk.Checkbutton(frame, text="Save WAV recording", variable=self.save_wav_var).grid(row=7, column=1, sticky="w")
+        ttk.Checkbutton(frame, text="Save raw-vs-clean compare file", variable=self.save_compare_var).grid(row=8, column=1, sticky="w")
+        ttk.Checkbutton(frame, text="Enable scanner correction rules", variable=self.enable_corrections_var).grid(row=9, column=1, sticky="w")
+
+        button_frame = ttk.Frame(frame)
+        button_frame.grid(row=10, column=1, sticky="w", pady=10)
+        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_transcription)
+        self.start_button.pack(side="left", padx=5)
+        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_transcription, state="disabled")
+        self.stop_button.pack(side="left", padx=5)
+
+        frame.columnconfigure(1, weight=1)
+        self.load_audio_devices()
+
+    def build_output_windows(self):
+        output_frame = ttk.Frame(self.root)
+        output_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        clean_frame = ttk.LabelFrame(output_frame, text="Clean Transcript")
+        clean_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        compare_frame = ttk.LabelFrame(output_frame, text="Raw vs Clean")
+        compare_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
+
+        self.clean_output = ScrolledText(clean_frame, wrap="word", height=25)
+        self.clean_output.pack(fill="both", expand=True)
+        self.compare_output = ScrolledText(compare_frame, wrap="word", height=25)
+        self.compare_output.pack(fill="both", expand=True)
+
+    def load_audio_devices(self):
+        self.device_map = {}
+        labels = []
+        hostapis = sd.query_hostapis()
+        for index, device in enumerate(sd.query_devices()):
+            max_inputs = int(device.get("max_input_channels", 0))
+            if max_inputs > 0:
+                name = device.get("name", "Unknown")
+                default_rate = int(device.get("default_samplerate", 0))
+                hostapi_name = hostapis[int(device.get("hostapi", 0))].get("name", "Unknown API")
+                label = f"[{index}] {name} | {hostapi_name} ({max_inputs} in, default {default_rate} Hz)"
+                labels.append(label)
+                self.device_map[label] = index
+        self.device_combo["values"] = labels
+        if labels:
+            self.device_var.set(next((x for x in labels if "stereo mix" in x.lower()), labels[0]))
+
+    def poll_gui_queue(self):
         try:
-            number = int(value)
-        except ValueError:
-            print("Please enter a number.")
-            continue
+            while True:
+                target, text = self.gui_queue.get_nowait()
+                if target == "clean":
+                    self.clean_output.insert("end", text + "\n")
+                    self.clean_output.see("end")
+                elif target == "compare":
+                    self.compare_output.insert("end", text + "\n\n")
+                    self.compare_output.see("end")
+                elif target == "status":
+                    self.clean_output.insert("end", f"[STATUS] {text}\n")
+                    self.clean_output.see("end")
+                elif target == "error":
+                    messagebox.showerror("ScannerScribe Error", text)
+                elif target == "done":
+                    self.start_button.config(state="normal")
+                    self.stop_button.config(state="disabled")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll_gui_queue)
 
-        if minimum is not None and number < minimum:
-            print(f"Please enter a number >= {minimum}.")
-            continue
+    def start_transcription(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.worker_thread = threading.Thread(target=self.transcription_worker, daemon=True)
+        self.worker_thread.start()
 
-        if maximum is not None and number > maximum:
-            print(f"Please enter a number <= {maximum}.")
-            continue
+    def stop_transcription(self):
+        self.stop_event.set()
+        self.gui_queue.put(("status", "Stopping transcription..."))
 
-        return number
+    def browse_model(self):
+        folder = filedialog.askdirectory(title="Select Vosk model folder")
+        if folder:
+            self.model_var.set(folder)
+
+    def browse_transcripts(self):
+        folder = filedialog.askdirectory(title="Select transcript folder")
+        if folder:
+            self.transcript_var.set(folder)
+
+    def browse_audio(self):
+        folder = filedialog.askdirectory(title="Select audio recording folder")
+        if folder:
+            self.audio_folder_var.set(folder)
 
 
-def get_input_devices():
-    devices = sd.query_devices()
-    input_devices = []
+    def _resolve_sample_rate(self, device_index, requested_rate, channels):
+        fallback_rates = [
+            requested_rate,
+            int(sd.query_devices(device_index).get("default_samplerate", requested_rate)),
+            48000,
+            44100,
+            16000,
+        ]
 
-    for index, device in enumerate(devices):
-        max_inputs = int(device.get("max_input_channels", 0))
+        checked = set()
+        for rate in fallback_rates:
+            if rate in checked or rate <= 0:
+                continue
+            checked.add(rate)
+            try:
+                sd.check_input_settings(device=device_index, samplerate=rate, channels=channels, dtype="int16")
+                return rate
+            except Exception:
+                continue
 
-        if max_inputs > 0:
-            input_devices.append((index, device))
-
-    return input_devices
-
-
-def choose_audio_device(default_device_index):
-    input_devices = get_input_devices()
-
-    print("\nUsable input devices:\n")
-
-    for index, device in input_devices:
-        name = device.get("name", "Unknown")
-        max_inputs = device.get("max_input_channels", 0)
-        default_samplerate = int(device.get("default_samplerate", 0))
-
-        marker = ""
-
-        if index == default_device_index:
-            marker = "  <-- current default"
-
-        print(
-            f"[{index}] {name} "
-            f"({max_inputs} input channel(s), default {default_samplerate} Hz)"
-            f"{marker}"
+        raise RuntimeError(
+            "Could not open input stream with this device/channels. Try changing Sample Rate or selecting another input device."
         )
 
-    valid_indexes = [index for index, device in input_devices]
-
-    if default_device_index not in valid_indexes:
-        print(
-            f"\nCurrent DEVICE_INDEX {default_device_index} is not a usable input device."
-        )
-
-        if input_devices:
-            default_device_index = input_devices[0][0]
-            print(f"Using first available input device as default: {default_device_index}")
-
-    while True:
-        selected = ask_int("Choose audio input device", default_device_index)
-
-        if selected in valid_indexes:
-            return selected
-
-        print("That device is not a usable input device. Choose a device with input channels.")
-
-
-def choose_channels(device_index, default_channels):
-    device = sd.query_devices(device_index)
-    max_inputs = int(device.get("max_input_channels", 1))
-
-    if default_channels > max_inputs:
-        default_channels = 1
-
-    return ask_int(
-        f"Channels to capture, usually 1 for Vosk",
-        default_channels,
-        minimum=1,
-        maximum=max_inputs,
-    )
-
-
-def choose_model(default_model_path):
-    models_dir = BASE_DIR / "models"
-
-    print("\nAvailable Vosk models:\n")
-
-    model_paths = []
-
-    if models_dir.exists():
-        for path in sorted(models_dir.iterdir()):
-            if path.is_dir():
-                model_paths.append(path)
-
-    if not model_paths:
-        print("No model folders found in models/.")
-        print(f"Current default model path: {default_model_path}")
-        typed_path = ask_text("Enter model path or press Enter to keep default", str(default_model_path))
-        return Path(typed_path)
-
-    for number, path in enumerate(model_paths, start=1):
-        marker = ""
-
-        if Path(default_model_path) == path:
-            marker = "  <-- current default"
-
-        print(f"[{number}] {path.name}{marker}")
-
-    print("[0] Keep current default")
-
-    while True:
-        choice = ask_int("Choose model", 0, minimum=0, maximum=len(model_paths))
-
-        if choice == 0:
-            return Path(default_model_path)
-
-        return model_paths[choice - 1]
-
-
-def choose_folder(prompt, default_folder):
-    selected = ask_text(prompt, str(default_folder))
-    return Path(selected).expanduser()
-
-
-def make_safe_session_name(user_input):
-    if not user_input:
-        return ""
-
-    text = user_input.lower().strip()
-
-    # Remove punctuation that should not split a word.
-    text = text.replace("'", "")
-    text = text.replace('"', "")
-    text = text.replace("`", "")
-
-    # Replace spaces, slashes, underscores, periods, and punctuation with hyphens.
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-
-    # Remove words already represented in the filename.
-    banned_words = {
-        "scanner",
-        "scribe",
-        "transcribe",
-        "transcriber",
-        "transcript",
-        "clean",
-        "raw",
-    }
-
-    parts = [part for part in text.split("-") if part and part not in banned_words]
-
-    safe_name = "-".join(parts)
-
-    # Collapse repeated hyphens just in case.
-    safe_name = re.sub(r"-+", "-", safe_name).strip("-")
-
-    return safe_name
-
-
-def make_output_paths(transcript_dir, audio_dir, session_name):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    safe_session_name = make_safe_session_name(session_name)
-
-    if safe_session_name:
-        suffix = f"_{safe_session_name}"
-    else:
-        suffix = ""
-
-    clean_file = transcript_dir / f"scanner-transcribe_{timestamp}{suffix}.txt"
-    compare_file = transcript_dir / f"scanner-transcribe-compare_{timestamp}{suffix}.txt"
-    wav_output_file = audio_dir / f"scanner-audio_{timestamp}{suffix}.wav"
-
-    return clean_file, compare_file, wav_output_file
-
-
-# --------------------------------------------------
-# COLLECT CLI SETTINGS
-# --------------------------------------------------
-
-print("\nScannerScribe CLI Setup")
-print("-----------------------")
-print("Press Enter to keep the default shown in brackets.\n")
-
-MODEL_PATH = choose_model(MODEL_PATH)
-
-DEVICE_INDEX = choose_audio_device(DEVICE_INDEX)
-
-SAMPLE_RATE = ask_int("Sample rate", SAMPLE_RATE, minimum=8000, maximum=192000)
-
-CHANNELS = choose_channels(DEVICE_INDEX, CHANNELS)
-
-SAVE_WAV = ask_yes_no("Save WAV recording", SAVE_WAV)
-
-SAVE_COMPARE = ask_yes_no("Save raw-vs-clean comparison transcript", SAVE_COMPARE)
-
-ENABLE_CORRECTIONS = ask_yes_no("Enable scanner correction rules", ENABLE_CORRECTIONS)
-
-TRANSCRIPT_FOLDER = choose_folder("Transcript save folder", TRANSCRIPT_FOLDER)
-
-if SAVE_WAV:
-    AUDIO_FOLDER = choose_folder("Audio recording save folder", AUDIO_FOLDER)
-
-SESSION_NAME = ask_text("Optional session name for filenames", "")
-
-# --------------------------------------------------
-# SETUP FILES
-# --------------------------------------------------
-
-audio_queue = queue.Queue()
-
-transcript_dir = Path(TRANSCRIPT_FOLDER)
-transcript_dir.mkdir(parents=True, exist_ok=True)
-
-audio_dir = Path(AUDIO_FOLDER)
-audio_dir.mkdir(parents=True, exist_ok=True)
-
-clean_transcript_file, compare_transcript_file, wav_file = make_output_paths(
-    transcript_dir,
-    audio_dir,
-    SESSION_NAME,
-)
-
-
-# --------------------------------------------------
-# HELPER FUNCTIONS
-# --------------------------------------------------
-
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(status, file=sys.stderr)
-
-    audio_queue.put(bytes(indata))
-
-
-def clean_scanner_text(text):
-    cleaned = text.lower().strip()
-
-    if ENABLE_CORRECTIONS:
-        for wrong_pattern, right_text in REPLACEMENTS:
-            cleaned = re.sub(wrong_pattern, right_text, cleaned, flags=re.IGNORECASE)
-
-    # Clean up extra spaces.
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    return cleaned
-
-
-def get_average_confidence(result):
-    words = result.get("result", [])
-
-    if not words:
-        return None
-
-    confidence_values = []
-
-    for word in words:
-        if "conf" in word:
-            confidence_values.append(word["conf"])
-
-    if not confidence_values:
-        return None
-
-    return sum(confidence_values) / len(confidence_values)
-
-
-def write_transcripts(raw_text, clean_text, confidence):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if confidence is None:
-        conf_text = "conf=unknown"
-    else:
-        conf_text = f"conf={confidence:.2f}"
-
-    clean_line = f"[{timestamp}] [{conf_text}] {clean_text}"
-
-    # This is what you see in the CLI.
-    print(clean_line)
-
-    # Clean transcript file.
-    with open(clean_transcript_file, "a", encoding="utf-8") as f:
-        f.write(clean_line + "\n")
-
-    if SAVE_COMPARE:
-        # Raw-vs-clean comparison file.
-        with open(compare_transcript_file, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [{conf_text}]\n")
-            f.write(f"RAW:   {raw_text}\n")
-            f.write(f"CLEAN: {clean_text}\n")
-            f.write("\n")
-
-
-def handle_result(result_json):
-    result = json.loads(result_json)
-
-    raw_text = result.get("text", "").strip()
-
-    if not raw_text:
-        return
-
-    confidence = get_average_confidence(result)
-    clean_text = clean_scanner_text(raw_text)
-
-    write_transcripts(raw_text, clean_text, confidence)
-
-
-# --------------------------------------------------
-# SHOW AUDIO DEVICES
-# --------------------------------------------------
-
-print("\nAvailable audio devices:\n")
-print(sd.query_devices())
-
-print("\nCurrent settings:")
-print(f"MODEL_PATH: {MODEL_PATH}")
-print(f"DEVICE_INDEX: {DEVICE_INDEX}")
-print(f"SAMPLE_RATE: {SAMPLE_RATE}")
-print(f"CHANNELS: {CHANNELS}")
-print(f"SAVE_WAV: {SAVE_WAV}")
-print(f"SAVE_COMPARE: {SAVE_COMPARE}")
-print(f"ENABLE_CORRECTIONS: {ENABLE_CORRECTIONS}")
-
-print("\nTranscript files:")
-print(f"Clean transcript:       {clean_transcript_file}")
-
-if SAVE_COMPARE:
-    print(f"Raw-vs-clean transcript:{compare_transcript_file}")
-
-if SAVE_WAV:
-    print(f"WAV recording:          {wav_file}")
-
-print("\nPress Ctrl+C to stop.\n")
-
-# --------------------------------------------------
-# VALIDATE AUDIO DEVICE BEFORE LOADING MODEL
-# --------------------------------------------------
-
-device_info = sd.query_devices(DEVICE_INDEX)
-
-if device_info["max_input_channels"] < 1:
-    raise ValueError(
-        f"DEVICE_INDEX {DEVICE_INDEX} is not an input device. "
-        f"It has {device_info['max_input_channels']} input channels. "
-        f"Choose a device with input channels."
-    )
-
-sd.check_input_settings(
-    device=DEVICE_INDEX,
-    samplerate=SAMPLE_RATE,
-    channels=CHANNELS,
-    dtype="int16",
-)
-
-print("Audio input device check passed.")
-
-
-# --------------------------------------------------
-# LOAD MODEL
-# --------------------------------------------------
-
-if not Path(MODEL_PATH).exists():
-    raise FileNotFoundError(f"Model path not found: {MODEL_PATH}")
-
-print("Loading Vosk model. This can take a while...")
-model = Model(str(MODEL_PATH))
-print("Model loaded.")
-
-recognizer = KaldiRecognizer(model, SAMPLE_RATE)
-
-# This is what enables word-level confidence.
-recognizer.SetWords(True)
-
-print("Recognizer ready.")
-
-
-# --------------------------------------------------
-# START TRANSCRIBING
-# --------------------------------------------------
-
-wav_writer = None
-
-try:
-    if SAVE_WAV:
-        wav_writer = wave.open(str(wav_file), "wb")
-        wav_writer.setnchannels(CHANNELS)
-        wav_writer.setsampwidth(2)  # int16 = 2 bytes
-        wav_writer.setframerate(SAMPLE_RATE)
-
-    with sd.RawInputStream(
-        samplerate=SAMPLE_RATE,
-        blocksize=8000,
-        device=DEVICE_INDEX,
-        dtype="int16",
-        channels=CHANNELS,
-        callback=audio_callback,
-    ):
-        while True:
-            data = audio_queue.get()
-
-            if SAVE_WAV and wav_writer is not None:
-                wav_writer.writeframes(data)
-
-            if recognizer.AcceptWaveform(data):
-                handle_result(recognizer.Result())
-
-except KeyboardInterrupt:
-    print("\nStopped transcription.")
-
-    final_result = recognizer.FinalResult()
-    handle_result(final_result)
-
-finally:
-    if wav_writer is not None:
-        wav_writer.close()
-
-    print("\nSaved files:")
-    print(f"Clean transcript:        {clean_transcript_file}")
-
-    if SAVE_COMPARE:
-        print(f"Raw-vs-clean transcript: {compare_transcript_file}")
-
-    if SAVE_WAV:
-        print(f"WAV recording:           {wav_file}")
+    def _format_compare_block(self, raw_text, clean_text, confidence):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if confidence is None:
+            conf_text = "n/a"
+        else:
+            conf_text = f"{confidence:.2f}"
+        return f"[{timestamp}] [conf={conf_text}]\nRAW:   {raw_text}\nCLEAN: {clean_text}"
+
+    def transcription_worker(self):
+        wav_file = None
+        clean_fh = None
+        compare_fh = None
+        try:
+            model_path = Path(self.model_var.get().strip())
+            transcript_folder = Path(self.transcript_var.get().strip())
+            audio_folder = Path(self.audio_folder_var.get().strip())
+            sample_rate = int(self.sample_rate_var.get().strip())
+            channels = int(self.channels_var.get().strip())
+            session_name = self.session_name_var.get().strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            device_label = self.device_var.get().strip()
+            if device_label not in self.device_map:
+                raise ValueError("Choose a valid audio input device.")
+            device_index = self.device_map[device_label]
+
+            if not model_path.exists():
+                raise FileNotFoundError(f"Model folder not found: {model_path}")
+
+            transcript_folder.mkdir(parents=True, exist_ok=True)
+            audio_folder.mkdir(parents=True, exist_ok=True)
+
+            clean_path = transcript_folder / f"{session_name}_clean.txt"
+            compare_path = transcript_folder / f"{session_name}_compare.txt"
+            wav_path = audio_folder / f"{session_name}.wav"
+
+            clean_fh = clean_path.open("w", encoding="utf-8")
+            if self.save_compare_var.get():
+                compare_fh = compare_path.open("w", encoding="utf-8")
+
+            if self.save_wav_var.get():
+                wav_file = wave.open(str(wav_path), "wb")
+                wav_file.setnchannels(channels)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+
+            device_info = sd.query_devices(device_index)
+            max_inputs = int(device_info.get("max_input_channels", 0))
+            if channels > max_inputs:
+                raise ValueError(f"Device supports up to {max_inputs} input channel(s), but {channels} were requested.")
+
+            self.gui_queue.put(("status", "Loading Vosk model..."))
+            model = Model(str(model_path))
+
+            working_rate = self._resolve_sample_rate(device_index, sample_rate, channels)
+            if working_rate != sample_rate:
+                self.gui_queue.put(("status", f"Requested {sample_rate} Hz failed; using {working_rate} Hz."))
+                sample_rate = working_rate
+
+            recognizer = KaldiRecognizer(model, sample_rate)
+            recognizer.SetWords(True)
+
+            def audio_callback(indata, frames, time_info, status):
+                if status:
+                    self.gui_queue.put(("status", f"Audio status: {status}"))
+                chunk = bytes(indata)
+                self.audio_queue.put(chunk)
+                if wav_file is not None:
+                    wav_file.writeframes(chunk)
+
+            with sd.RawInputStream(
+                samplerate=sample_rate,
+                blocksize=0,
+                device=device_index,
+                dtype="int16",
+                channels=channels,
+                callback=audio_callback,
+            ):
+                self.gui_queue.put(("status", "Transcription started."))
+                while not self.stop_event.is_set():
+                    try:
+                        data = self.audio_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+
+                    if not recognizer.AcceptWaveform(data):
+                        continue
+
+                    result = json.loads(recognizer.Result())
+                    raw_text = result.get("text", "").strip()
+                    if not raw_text:
+                        continue
+
+                    words = result.get("result", [])
+                    confidence = 0.0
+                    if words:
+                        confidence = sum(float(x.get("conf", 0.0)) for x in words) / len(words)
+
+                    clean_text = raw_text
+                    if self.enable_corrections_var.get():
+                        for pattern, replacement in REPLACEMENTS:
+                            clean_text = re.sub(pattern, replacement, clean_text, flags=re.IGNORECASE)
+
+                    clean_fh.write(clean_text + "\n")
+                    clean_fh.flush()
+                    self.gui_queue.put(("clean", clean_text))
+
+                    if compare_fh is not None:
+                        compare_block = self._format_compare_block(raw_text, clean_text, confidence)
+                        compare_fh.write(compare_block + "\n\n")
+                        compare_fh.flush()
+                        self.gui_queue.put(("compare", compare_block))
+
+                final_result = json.loads(recognizer.FinalResult())
+                final_raw = final_result.get("text", "").strip()
+                if final_raw:
+                    final_clean = final_raw
+                    final_words = final_result.get("result", [])
+                    final_confidence = None
+                    if final_words:
+                        final_confidence = sum(float(x.get("conf", 0.0)) for x in final_words) / len(final_words)
+                    if self.enable_corrections_var.get():
+                        for pattern, replacement in REPLACEMENTS:
+                            final_clean = re.sub(pattern, replacement, final_clean, flags=re.IGNORECASE)
+                    clean_fh.write(final_clean + "\n")
+                    self.gui_queue.put(("clean", final_clean))
+                    if compare_fh is not None:
+                        final_compare_block = self._format_compare_block(final_raw, final_clean, final_confidence)
+                        compare_fh.write(final_compare_block + "\n\n")
+                        compare_fh.flush()
+                        self.gui_queue.put(("compare", final_compare_block))
+
+            self.gui_queue.put(("status", f"Saved clean transcript: {clean_path}"))
+            if compare_fh is not None:
+                self.gui_queue.put(("status", f"Saved compare transcript: {compare_path}"))
+            if wav_file is not None:
+                self.gui_queue.put(("status", f"Saved WAV file: {wav_path}"))
+
+        except Exception as exc:
+            self.gui_queue.put(("error", str(exc)))
+        finally:
+            if clean_fh is not None:
+                clean_fh.close()
+            if compare_fh is not None:
+                compare_fh.close()
+            if wav_file is not None:
+                wav_file.close()
+            self.stop_event.set()
+            self.gui_queue.put(("done", ""))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.geometry("1300x780")
+    app = ScannerScribeGUI(root)
+    root.mainloop()
