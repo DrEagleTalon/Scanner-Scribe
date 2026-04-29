@@ -136,12 +136,14 @@ class ScannerScribeGUI:
     def load_audio_devices(self):
         self.device_map = {}
         labels = []
+        hostapis = sd.query_hostapis()
         for index, device in enumerate(sd.query_devices()):
             max_inputs = int(device.get("max_input_channels", 0))
             if max_inputs > 0:
                 name = device.get("name", "Unknown")
                 default_rate = int(device.get("default_samplerate", 0))
-                label = f"[{index}] {name} ({max_inputs} in, default {default_rate} Hz)"
+                hostapi_name = hostapis[int(device.get("hostapi", 0))].get("name", "Unknown API")
+                label = f"[{index}] {name} | {hostapi_name} ({max_inputs} in, default {default_rate} Hz)"
                 labels.append(label)
                 self.device_map[label] = index
         self.device_combo["values"] = labels
@@ -306,6 +308,11 @@ class ScannerScribeGUI:
                     if not raw_text:
                         continue
 
+                    words = result.get("result", [])
+                    confidence = 0.0
+                    if words:
+                        confidence = sum(float(x.get("conf", 0.0)) for x in words) / len(words)
+
                     clean_text = raw_text
                     if self.enable_corrections_var.get():
                         for pattern, replacement in REPLACEMENTS:
@@ -316,7 +323,7 @@ class ScannerScribeGUI:
                     self.gui_queue.put(("clean", clean_text))
 
                     if compare_fh is not None:
-                        compare_block = f"RAW: {raw_text}\nCLEAN: {clean_text}"
+                        compare_block = f"CONF: {confidence:.2f}\nRAW: {raw_text}\nCLEAN: {clean_text}"
                         compare_fh.write(compare_block + "\n\n")
                         compare_fh.flush()
                         self.gui_queue.put(("compare", compare_block))
@@ -325,11 +332,17 @@ class ScannerScribeGUI:
                 final_raw = final_result.get("text", "").strip()
                 if final_raw:
                     final_clean = final_raw
+                    final_confidence = "n/a (final)"
                     if self.enable_corrections_var.get():
                         for pattern, replacement in REPLACEMENTS:
                             final_clean = re.sub(pattern, replacement, final_clean, flags=re.IGNORECASE)
                     clean_fh.write(final_clean + "\n")
                     self.gui_queue.put(("clean", final_clean))
+                    if compare_fh is not None:
+                        final_compare_block = f"CONF: {final_confidence}\nRAW: {final_raw}\nCLEAN: {final_clean}"
+                        compare_fh.write(final_compare_block + "\n\n")
+                        compare_fh.flush()
+                        self.gui_queue.put(("compare", final_compare_block))
 
             self.gui_queue.put(("status", f"Saved clean transcript: {clean_path}"))
             if compare_fh is not None:
